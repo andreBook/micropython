@@ -61,6 +61,8 @@ struct ctr_params {
 #endif
 
 #if MICROPY_SSL_MBEDTLS
+#include <mbedtls/pk.h>
+#include <mbedtls/rsa.h>
 #include <mbedtls/aes.h>
 
 // we can't run mbedtls AES key schedule until we know whether we're used for encrypt or decrypt.
@@ -208,6 +210,170 @@ STATIC void aes_process_ctr_impl(AES_CTX_IMPL *ctx, const uint8_t *in, uint8_t *
     mbedtls_aes_crypt_ctr(&ctx->u.mbedtls_ctx, in_len, &ctr_params->offset, ctx->iv, ctr_params->encrypted_counter, in, out);
 }
 #endif
+
+typedef struct _mp_obj_rsa_t {
+    mp_obj_base_t base;
+    mbedtls_rsa_context *rsa;
+#define RSA_KEYTYPE_PUBLIC  1
+#define RSA_KEYTYPE_PRIVATE  2
+    uint8_t rsa_key_type;
+} mp_obj_rsa_t;
+
+
+STATIC mp_obj_t ucryptolib_rsa_importKey(mp_obj_t self_in, mp_obj_t arg) {
+    mp_obj_rsa_t *self = MP_OBJ_TO_PTR(self_in);
+
+    mp_buffer_info_t bufkey;
+    mp_get_buffer_raise(arg, &bufkey, MP_BUFFER_READ);
+
+    int ret;
+    mbedtls_pk_context pk;
+    mbedtls_pk_init( &pk );
+    ret = mbedtls_pk_parse_key(&pk, bufkey.buf, bufkey.len + 1, NULL, 0);
+    if ( ret == 0 ) {
+        self->rsa_key_type = RSA_KEYTYPE_PRIVATE;
+    } else {
+        ret = mbedtls_pk_parse_public_key(&pk, bufkey.buf, bufkey.len + 1);
+        if (ret != 0) {
+            mbedtls_pk_free(&pk);
+            mp_raise_ValueError("Unable to parse key");
+        }
+        self->rsa_key_type = RSA_KEYTYPE_PUBLIC;
+    }
+
+    if(!mbedtls_pk_can_do(&pk, MBEDTLS_PK_RSA))
+    {
+	    mbedtls_pk_free(&pk);
+        mp_raise_ValueError("Not an RSA key");
+    }
+
+    self->rsa = mbedtls_pk_rsa( pk );
+    
+    return MP_OBJ_FROM_PTR(self);
+
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(ucryptolib_rsa_importKey_obj, ucryptolib_rsa_importKey);
+
+STATIC mp_obj_t ucryptolib_rsa_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    mp_arg_check_num(n_args, n_kw, 0, 1, false); 
+    mp_obj_rsa_t *o = m_new_obj(mp_obj_rsa_t);
+    o->base.type = type;
+    o->rsa_key_type = 0;
+    
+    if (n_args == 1) {
+        ucryptolib_rsa_importKey(o, args[0]);
+    }
+
+    return MP_OBJ_FROM_PTR(o);
+
+}
+
+
+
+typedef struct _mp_obj_pkcs1v15_t {
+    mp_obj_base_t base;
+    mp_obj_rsa_t *key;
+} mp_obj_pkcs1v15_t;
+
+STATIC mp_obj_t ucryptolib_pkcs1v15_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    mp_arg_check_num(n_args, n_kw, 1, 1, false);
+    mp_obj_pkcs1v15_t *o = m_new_obj(mp_obj_pkcs1v15_t);
+    o->base.type = type;
+    o->key =  MP_OBJ_TO_PTR(args[0]);
+
+
+    return MP_OBJ_FROM_PTR(o);
+}
+
+STATIC mp_obj_t ucryptolib_pkcs1v15_sign(mp_obj_t self_in, mp_obj_t hash) {
+    mp_obj_pkcs1v15_t *self = MP_OBJ_TO_PTR(self_in);
+
+    mp_buffer_info_t hash_bufinfo;
+    mp_get_buffer_raise(hash, &hash_bufinfo, MP_BUFFER_READ);
+ 
+    int ret;
+
+
+    if ( (self->key)->rsa_key_type == 0 ) {
+        mp_raise_ValueError("No RSA key available to sign message");
+    }
+
+    if ( (self->key)->rsa_key_type == RSA_KEYTYPE_PUBLIC ) {
+        mp_raise_ValueError("Unable to sign message with public key");
+    }
+
+    vstr_t signature;
+    vstr_init_len(&signature, ((self->key)->rsa)->len);
+
+    if ( hash_bufinfo.len != 32 ) { // why we have to do that ? It's an open question.
+        if( ( ret = mbedtls_rsa_pkcs1_sign((self->key)->rsa , NULL, NULL, MBEDTLS_RSA_PRIVATE, MBEDTLS_MD_NONE,
+                                    hash_bufinfo.len, hash_bufinfo.buf, (byte*)signature.buf ) ) != 0 ) 
+        {
+            mp_raise_ValueError("Unable to sign message");
+        }
+    } else {
+        if( ( ret = mbedtls_rsa_pkcs1_sign((self->key)->rsa , NULL, NULL, MBEDTLS_RSA_PRIVATE, MBEDTLS_MD_SHA256,
+                                    0, hash_bufinfo.buf, (byte*)signature.buf ) ) != 0 )
+        {
+            mp_raise_ValueError("Unable to sign message");
+        }
+    }
+    return mp_obj_new_str_from_vstr(&mp_type_bytes, &signature);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(ucryptolib_pkcs1v15_sign_obj, ucryptolib_pkcs1v15_sign);
+
+
+STATIC mp_obj_t ucryptolib_pkcs1v15_verify(mp_obj_t self_in, mp_obj_t hash, mp_obj_t signature) {
+    mp_obj_pkcs1v15_t *self = MP_OBJ_TO_PTR(self_in);
+
+    mp_buffer_info_t hash_bufinfo;
+    mp_get_buffer_raise(hash, &hash_bufinfo, MP_BUFFER_READ);
+
+    mp_buffer_info_t sign_bufinfo;
+    mp_get_buffer_raise(signature, &sign_bufinfo, MP_BUFFER_READ);
+
+    if ( (self->key)->rsa_key_type == 0 ) {
+        mp_raise_ValueError("No RSA key available to verify message");
+    }
+
+    if ( (self->key)->rsa_key_type == RSA_KEYTYPE_PRIVATE ) {
+        mp_raise_ValueError("Unable to verify message with private key");
+    }
+
+    int ret;
+
+    ret = mbedtls_rsa_pkcs1_verify((self->key)->rsa , NULL, NULL, MBEDTLS_RSA_PUBLIC, MBEDTLS_MD_NONE,
+                                hash_bufinfo.len, hash_bufinfo.buf, sign_bufinfo.buf );
+
+    return mp_obj_new_bool(ret == 0);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_3(ucryptolib_pkcs1v15_verify_obj, ucryptolib_pkcs1v15_verify);
+
+STATIC const mp_rom_map_elem_t ucryptolib_rsa_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_importKey), MP_ROM_PTR(&ucryptolib_rsa_importKey_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(ucryptolib_rsa_locals_dict, ucryptolib_rsa_locals_dict_table);
+
+STATIC const mp_rom_map_elem_t ucryptolib_pkcs1v15_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_sign), MP_ROM_PTR(&ucryptolib_pkcs1v15_sign_obj) },
+    { MP_ROM_QSTR(MP_QSTR_verify), MP_ROM_PTR(&ucryptolib_pkcs1v15_verify_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(ucryptolib_pkcs1v15_locals_dict, ucryptolib_pkcs1v15_locals_dict_table);
+
+STATIC const mp_obj_type_t ucryptolib_rsa_type = {
+    { &mp_type_type },
+    .name = MP_QSTR_rsa,
+    .make_new = ucryptolib_rsa_make_new,
+    .locals_dict = (void*)&ucryptolib_rsa_locals_dict,
+};
+
+STATIC const mp_obj_type_t ucryptolib_pkcs1v15_type = {
+    { &mp_type_type },
+    .name = MP_QSTR_pkcs1v15,
+    .make_new = ucryptolib_pkcs1v15_make_new,
+    .locals_dict = (void*)&ucryptolib_pkcs1v15_locals_dict,
+};
+
 
 #endif
 
@@ -359,6 +525,10 @@ STATIC const mp_obj_type_t ucryptolib_aes_type = {
 STATIC const mp_rom_map_elem_t mp_module_ucryptolib_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_ucryptolib) },
     { MP_ROM_QSTR(MP_QSTR_aes), MP_ROM_PTR(&ucryptolib_aes_type) },
+    #if MICROPY_SSL_MBEDTLS
+        { MP_ROM_QSTR(MP_QSTR_rsa), MP_ROM_PTR(&ucryptolib_rsa_type) },
+        { MP_ROM_QSTR(MP_QSTR_pkcs1v15), MP_ROM_PTR(&ucryptolib_pkcs1v15_type) },
+    #endif
     #if MICROPY_PY_UCRYPTOLIB_CONSTS
     { MP_ROM_QSTR(MP_QSTR_MODE_ECB), MP_ROM_INT(UCRYPTOLIB_MODE_ECB) },
     { MP_ROM_QSTR(MP_QSTR_MODE_CBC), MP_ROM_INT(UCRYPTOLIB_MODE_CBC) },
